@@ -1,0 +1,523 @@
+#!/usr/bin/env python3
+# check_puppetfile
+#
+# Developer and maintainer:
+#   Jerald Sheets <questy@gmail.com>
+"""Report Puppetfile Forge modules against the latest Forge release.
+
+With no switches, this only prints the report. It does not edit the
+Puppetfile, write a backup, or change the git index.
+
+Each Forge pin is resolved to current_release. The report lists every
+module, the pinned version, the latest version, and whether the pin is
+current or behind. Git modules (mod 'name', :git => ...) are skipped.
+The Forge does not publish those.
+
+  --help     show this text and exit
+  -f         rewrite behind pins to the latest Forge release
+  --recover  restore one of the last five Puppetfiles saved by -f
+
+-f and --recover are the only switches that change a Puppetfile.
+-f is destructive. It rewrites every behind pin in one pass. Read the
+report and check each module before you confirm. The previous Puppetfile
+is copied to a changes/ directory next to that file. Only the five
+newest copies are kept.
+
+Exit status is 0 when every Forge pin is current or newer, 1 when any
+module is behind or the Forge lookup failed, and 2 when the Puppetfile
+cannot be read or the user cancels a write.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import shutil
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+
+FORGE_API = "https://forgeapi.puppet.com/v3/modules"
+USER_AGENT = "puppetfile-checker"
+BACKUP_KEEP = 5
+
+# mod 'owner-name', '1.2.3'   or   mod "owner-name", "1.2.3"
+FORGE_MOD = re.compile(
+    r"""^\s*mod\s+['"]([^'"]+)['"]\s*,\s*['"]([^'"]+)['"]""",
+)
+# Same line, with the version quote captured so -f can replace it.
+FORGE_LINE = re.compile(
+    r"""^(\s*mod\s+(['"])([^'"]+)\2\s*,\s*)(['"])([^'"]+)(['"])(.*)$""",
+)
+# mod 'name', :git => ...   (version lives in git, not on the Forge)
+GIT_MOD = re.compile(
+    r"""^\s*mod\s+['"]([^'"]+)['"]\s*,\s*$""",
+)
+VERSION_PART = re.compile(r"^(\d+)(.*)$")
+# A Forge version is digits split by dots or hyphens, optional v prefix.
+VERSION_TEXT = re.compile(r"^[vV]?\d+(?:[.\-]\d+)*$")
+
+
+def changes_dir(puppetfile: Path) -> Path:
+    """Backup directory next to the Puppetfile being checked.
+
+    The tool can live anywhere. Backups stay with the file they came
+    from, not next to this script.
+    """
+    return puppetfile.resolve().parent / "changes"
+
+
+def parse_puppetfile(text: str) -> tuple[list[tuple[str, str]], list[str]]:
+    """Return (forge pins, git module names)."""
+    forge: list[tuple[str, str]] = []
+    git: list[str] = []
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].rstrip()
+        if not line.strip():
+            continue
+        forge_match = FORGE_MOD.match(line)
+        if forge_match:
+            forge.append((forge_match.group(1), forge_match.group(2)))
+            continue
+        git_match = GIT_MOD.match(line)
+        if git_match:
+            git.append(git_match.group(1))
+    return forge, git
+
+
+def canonical_version(version: str) -> str:
+    """Version text with a v prefix and build metadata removed."""
+    text = version.strip()
+    if text[:1] in ("v", "V"):
+        text = text[1:]
+    return text.split("+", 1)[0]
+
+
+def version_numbers(version: str) -> tuple[int, ...] | None:
+    """Integer components, or None when the text is not a plain version.
+
+    Trailing zeros are padded to three components, so 1.0 and 1.0.0 are
+    the same release. Extra components stay, so 6.0.0-0-3 is not 6.0.0.
+    """
+    text = canonical_version(version)
+    if not VERSION_TEXT.match(version.strip()):
+        return None
+    numbers = [int(piece) for piece in re.split(r"[.\-]", text) if piece]
+    while len(numbers) < 3:
+        numbers.append(0)
+    return tuple(numbers)
+
+
+def same_release(pinned: str, latest: str) -> bool:
+    """True when the pin and the Forge version are one release.
+
+    String equality is not enough. 8.1.0 and v8.1.0, and 1.0 and
+    1.0.0, are the same release. A row like that is current.
+    """
+    if canonical_version(pinned) == canonical_version(latest):
+        return True
+    left = version_numbers(pinned)
+    right = version_numbers(latest)
+    return left is not None and left == right
+
+
+def version_key(version: str) -> tuple:
+    """Sort key for Forge versions, including 6.0.0-0-3 style pins.
+
+    Numeric runs compare as integers. Everything else compares as text.
+    Missing fields sort before present ones, so 1.0.0 is before 1.0.0-1.
+    """
+    parts: list[tuple] = []
+    for piece in re.split(r"[.\-]", version.strip()):
+        if not piece:
+            continue
+        match = VERSION_PART.match(piece)
+        if match:
+            parts.append((0, int(match.group(1)), match.group(2)))
+        else:
+            parts.append((1, piece))
+    return tuple(parts)
+
+
+def fetch_current(slug: str, timeout: float) -> tuple[str | None, str | None]:
+    """Return (latest version, error). latest is None on failure."""
+    url = f"{FORGE_API}/{slug}"
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.load(response)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return None, "not on the Forge"
+        return None, f"HTTP {exc.code}"
+    except urllib.error.URLError as exc:
+        return None, str(exc.reason)
+    except (TimeoutError, json.JSONDecodeError) as exc:
+        return None, str(exc)
+
+    version = accepted_version(slug, payload)
+    if not version:
+        return None, "Forge returned no current release"
+    return version, None
+
+
+def accepted_version(slug: str, payload: dict) -> str | None:
+    """Newest Forge release that is still published and is a version.
+
+    current_release is preferred. A deleted release, or a version that
+    is not digits, is skipped. The releases list is the fallback.
+    A version that does not belong to this module is rejected.
+    """
+    candidates = []
+    current = payload.get("current_release") or {}
+    if current:
+        candidates.append(current)
+    candidates.extend(payload.get("releases") or [])
+    owner = str(payload.get("slug") or slug)
+    for release in candidates:
+        if not isinstance(release, dict):
+            continue
+        if release.get("deleted_at") or release.get("deleted_for"):
+            continue
+        release_slug = str(release.get("slug") or "")
+        if release_slug and not release_slug.startswith(owner + "-"):
+            continue
+        version = str(release.get("version") or "").strip()
+        if version_numbers(version) is None:
+            continue
+        return version
+    return None
+
+
+def rewrite_puppetfile(text: str, updates: dict[str, str]) -> tuple[str, int]:
+    """Replace pinned versions. Returns (new text, number of lines changed).
+
+    Only the version quote on a Forge mod line is rewritten. Comments and
+    git modules are left alone. A pin is changed only when it is the
+    version we compared, so a line edited by hand mid-run is not touched.
+    """
+    changed = 0
+    lines: list[str] = []
+    for raw in text.splitlines(keepends=True):
+        newline = ""
+        body = raw
+        if raw.endswith("\r\n"):
+            newline = "\r\n"
+            body = raw[:-2]
+        elif raw.endswith("\n"):
+            newline = "\n"
+            body = raw[:-1]
+        match = FORGE_LINE.match(body)
+        if match:
+            slug = match.group(3)
+            pinned = match.group(5)
+            latest = updates.get(slug)
+            if latest and latest != pinned:
+                body = (
+                    f"{match.group(1)}{match.group(4)}{latest}"
+                    f"{match.group(6)}{match.group(7)}"
+                )
+                changed += 1
+        lines.append(body + newline)
+    return "".join(lines), changed
+
+
+def _git_index(changes: Path) -> Path | None:
+    """Top of the git checkout that owns the backup directory, if any."""
+    for parent in [changes, *changes.parents]:
+        git_dir = parent / ".git"
+        if git_dir.exists():
+            return parent
+    return None
+
+
+def _stage_backup(root: Path, path: Path, remove: bool) -> None:
+    """Keep the backup set in the index so rotation is what gets committed.
+
+    ``git add`` records a new copy. ``git rm --cached`` drops an aged copy
+    from the index and leaves a deletion for the next commit. A checkout
+    that is not a git repo, or a git failure, still keeps the files on disk.
+    """
+    relative = path.relative_to(root).as_posix()
+    command = ["git", "-C", str(root), "rm", "--cached", "--quiet", "--", relative]
+    if not remove:
+        command = ["git", "-C", str(root), "add", "--", relative]
+    try:
+        subprocess.run(command, check=False, capture_output=True, text=True)
+    except OSError:
+        return
+
+
+def backup_puppetfile(path: Path) -> Path:
+    """Copy path into changes/ beside it and keep BACKUP_KEEP copies.
+
+    Older copies are deleted from disk and removed from the git index.
+    The new copy is staged. Commit those index changes to publish the
+    rotation.
+    """
+    dest_dir = changes_dir(path)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    dest = dest_dir / f"Puppetfile.{stamp}"
+    # A second -f in the same second must not clobber the previous copy.
+    suffix = 1
+    while dest.exists():
+        dest = dest_dir / f"Puppetfile.{stamp}.{suffix}"
+        suffix += 1
+    shutil.copy2(path, dest)
+    backups = sorted(dest_dir.glob("Puppetfile.*"))
+    root = _git_index(dest_dir)
+    if root is not None:
+        _stage_backup(root, dest, remove=False)
+    for old in backups[:-BACKUP_KEEP]:
+        if root is not None:
+            _stage_backup(root, old, remove=True)
+        old.unlink(missing_ok=True)
+    return dest
+
+
+def list_backups(puppetfile: Path) -> list[Path]:
+    """Newest backup first, from changes/ next to the Puppetfile."""
+    dest_dir = changes_dir(puppetfile)
+    if not dest_dir.is_dir():
+        return []
+    found = [path for path in dest_dir.glob("Puppetfile.*") if path.is_file()]
+    found.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    return found[:BACKUP_KEEP]
+
+
+def confirm(prompt: str, accept: str) -> bool:
+    """True only when the user types the exact word. Needs a terminal."""
+    if not sys.stdin.isatty():
+        print("error: this needs a terminal so you can confirm.", file=sys.stderr)
+        return False
+    try:
+        answer = input(prompt)
+    except EOFError:
+        print()
+        return False
+    return answer.strip() == accept
+
+
+def print_report(
+    path: Path,
+    git_modules: list[str],
+    resolved: list[tuple[str, str, str | None, str]],
+) -> None:
+    """Print every resolved module. Does not write the Puppetfile."""
+    print(f"Puppetfile: {path}")
+    print(f"Forge modules: {len(resolved)}")
+    if git_modules:
+        names = ", ".join(git_modules)
+        print(f"Skipped git modules (no Forge version): {names}")
+    print()
+
+    if not resolved:
+        print("No Forge modules to resolve.")
+        return
+
+    name_width = max(len(slug) for slug, _, _, _ in resolved)
+    pin_width = max(len(pinned) for _, pinned, _, _ in resolved)
+    latest_width = max(len(latest or "-") for _, _, latest, _ in resolved)
+    print(
+        f"{'module':<{name_width}}  {'pinned':<{pin_width}}  "
+        f"{'latest':<{latest_width}}  status"
+    )
+    print(
+        f"{'-' * name_width}  {'-' * pin_width}  "
+        f"{'-' * latest_width}  ------"
+    )
+    behind = 0
+    failed = 0
+    for slug, pinned, latest, status in resolved:
+        shown = latest if latest is not None else "-"
+        print(
+            f"{slug:<{name_width}}  {pinned:<{pin_width}}  "
+            f"{shown:<{latest_width}}  {status}"
+        )
+        if status == "update":
+            behind += 1
+        elif status != "current":
+            failed += 1
+    print()
+    if behind:
+        print(f"{behind} module(s) should be updated.")
+    else:
+        print("Every Forge module that resolved is at the latest release.")
+    if failed:
+        print(f"{failed} module(s) could not be resolved.")
+
+
+def apply_updates(path: Path, text: str, behind: list[tuple[str, str, str]]) -> int:
+    """Backup, then rewrite behind pins after the user types 'update'."""
+    print()
+    print("WARNING: -f rewrites the Puppetfile in place.")
+    print("A newer Forge release can drop support, change defaults, or")
+    print("break this control repo. Read every row above and decide module")
+    print("by module. This switch cannot update just one of them.")
+    print("Git modules are not touched. Modules the Forge could not look")
+    print("up are not touched.")
+    print(f"The current file is copied to {changes_dir(path)} first.")
+    print(f"Only the last {BACKUP_KEEP} copies are kept.")
+    print()
+    if not confirm("Type update to rewrite the Puppetfile: ", "update"):
+        print("Cancelled. Puppetfile was not changed.")
+        return 2
+
+    backup = backup_puppetfile(path)
+    updates = {slug: latest for slug, _pinned, latest in behind}
+    new_text, changed = rewrite_puppetfile(text, updates)
+    path.write_text(new_text, encoding="utf-8")
+    print(f"Updated {changed} pin(s) in {path}")
+    print(f"Backup: {backup}")
+    return 1 if changed else 0
+
+
+def recover(path: Path) -> int:
+    """Let the user copy one of the last five backups over the Puppetfile."""
+    backups = list_backups(path)
+    if not backups:
+        print(f"No backups in {changes_dir(path)}")
+        print("Backups are written only when -f changes a Puppetfile.")
+        return 2
+
+    print(f"Backups in {changes_dir(path)} (newest first).")
+    print("The date is when that copy was saved, which is the last time")
+    print("that Puppetfile was the file -f replaced.")
+    print()
+    for index, backup in enumerate(backups, start=1):
+        when = datetime.fromtimestamp(backup.stat().st_mtime)
+        stamp = when.strftime("%Y-%m-%d %H:%M:%S")
+        print(f"  {index}. {stamp}  {backup.name}")
+    print()
+    print("WARNING: --recover overwrites the Puppetfile you name.")
+    print("The file you have now is copied into changes/ next to it first.")
+    print()
+    if not sys.stdin.isatty():
+        print("error: --recover needs a terminal.", file=sys.stderr)
+        return 2
+    try:
+        answer = input("Select a number, or q to cancel: ")
+    except EOFError:
+        print()
+        return 2
+    choice = answer.strip().lower()
+    if choice in {"q", "quit", "cancel", ""}:
+        print("Cancelled. Puppetfile was not changed.")
+        return 2
+    if not choice.isdigit() or not 1 <= int(choice) <= len(backups):
+        print(f"error: choose 1 through {len(backups)}", file=sys.stderr)
+        return 2
+
+    selected = backups[int(choice) - 1]
+    if path.exists():
+        saved = backup_puppetfile(path)
+        print(f"Current Puppetfile saved to {saved}")
+    shutil.copy2(selected, path)
+    print(f"Restored {selected.name} to {path}")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Resolve each Puppetfile Forge pin and print pinned versus "
+            "latest. The Puppetfile is not changed unless -f or --recover "
+            "is given."
+        ),
+    )
+    parser.add_argument(
+        "puppetfile",
+        nargs="?",
+        default="Puppetfile",
+        help="Path to the Puppetfile (default: ./Puppetfile)",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=30.0,
+        help="Seconds to wait for each Forge request (default: 30)",
+    )
+    parser.add_argument(
+        "-f",
+        action="store_true",
+        help=(
+            "Rewrite every behind pin to the latest Forge release. "
+            "Destructive. Asks you to type 'update' first, and keeps a "
+            f"backup of the last {BACKUP_KEEP} Puppetfiles in changes/ "
+            "next to the Puppetfile."
+        ),
+    )
+    parser.add_argument(
+        "--recover",
+        action="store_true",
+        help=(
+            "Show the last five Puppetfile backups with the date each was "
+            "saved, and restore the one you select."
+        ),
+    )
+    args = parser.parse_args(argv)
+
+    if args.f and args.recover:
+        print("error: use -f or --recover, not both", file=sys.stderr)
+        return 2
+
+    path = Path(args.puppetfile)
+    if args.recover:
+        return recover(path)
+
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        print(f"error: cannot read {path}: {exc}", file=sys.stderr)
+        return 2
+
+    forge, git_modules = parse_puppetfile(text)
+    if not forge and not git_modules:
+        print(f"error: no modules found in {path}", file=sys.stderr)
+        return 2
+
+    resolved: list[tuple[str, str, str | None, str]] = []
+    behind: list[tuple[str, str, str]] = []
+    failed = False
+
+    for slug, pinned in forge:
+        latest, error = fetch_current(slug, args.timeout)
+        if error or latest is None:
+            resolved.append((slug, pinned, None, error or "lookup failed"))
+            failed = True
+            continue
+        # Same release first. The sort key can order two spellings of
+        # one version as "behind" (8.1.0 versus v8.1.0, 1.0 versus 1.0.0).
+        if same_release(pinned, latest):
+            resolved.append((slug, pinned, latest, "current"))
+        elif version_key(pinned) < version_key(latest):
+            resolved.append((slug, pinned, latest, "update"))
+            behind.append((slug, pinned, latest))
+        else:
+            resolved.append((slug, pinned, latest, "current"))
+
+    # Updates first, then current pins, then lookups that failed.
+    resolved.sort(key=lambda row: ({"update": 0, "current": 1}.get(row[3], 2), row[0]))
+    print_report(path, git_modules, resolved)
+
+    if args.f:
+        if not behind:
+            print()
+            print("Nothing to write. Puppetfile was not changed.")
+            return 1 if failed else 0
+        return apply_updates(path, text, behind)
+
+    print()
+    print("Puppetfile was not changed.")
+    if behind or failed:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
