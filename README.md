@@ -84,9 +84,8 @@ Before it writes, the script copies the Puppetfile to `changes/` in
 the same directory as that file. Only the five newest copies are kept.
 Type the word `update` to confirm. Any other answer cancels.
 
-When that directory is inside a git checkout, the new backup is staged
-and an aged backup is removed from the index. Commit that change
-yourself. The script does not commit.
+The script does not stage or commit those copies. Add `changes/` to
+`.gitignore` if the Puppetfile lives in a git checkout.
 
 ### Restoring a backup
 
@@ -116,6 +115,17 @@ mod 'profiles',
 
 A deleted Forge release is not offered as an update. A value that is
 not a version is not offered either.
+
+## Tests
+
+GitHub Actions runs the suite on Python 3.9, 3.10, 3.11, 3.12, and
+3.13. The tests stub the Forge, so CI does not call
+`forgeapi.puppet.com`.
+
+```bash
+python3 -m pip install pytest
+python3 -m pytest
+```
 
 ## License
 

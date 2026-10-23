@@ -34,7 +34,6 @@ import argparse
 import json
 import re
 import shutil
-import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -226,38 +225,10 @@ def rewrite_puppetfile(text: str, updates: dict[str, str]) -> tuple[str, int]:
     return "".join(lines), changed
 
 
-def _git_index(changes: Path) -> Path | None:
-    """Top of the git checkout that owns the backup directory, if any."""
-    for parent in [changes, *changes.parents]:
-        git_dir = parent / ".git"
-        if git_dir.exists():
-            return parent
-    return None
-
-
-def _stage_backup(root: Path, path: Path, remove: bool) -> None:
-    """Keep the backup set in the index so rotation is what gets committed.
-
-    ``git add`` records a new copy. ``git rm --cached`` drops an aged copy
-    from the index and leaves a deletion for the next commit. A checkout
-    that is not a git repo, or a git failure, still keeps the files on disk.
-    """
-    relative = path.relative_to(root).as_posix()
-    command = ["git", "-C", str(root), "rm", "--cached", "--quiet", "--", relative]
-    if not remove:
-        command = ["git", "-C", str(root), "add", "--", relative]
-    try:
-        subprocess.run(command, check=False, capture_output=True, text=True)
-    except OSError:
-        return
-
-
 def backup_puppetfile(path: Path) -> Path:
     """Copy path into changes/ beside it and keep BACKUP_KEEP copies.
 
-    Older copies are deleted from disk and removed from the git index.
-    The new copy is staged. Commit those index changes to publish the
-    rotation.
+    Older copies are deleted from disk. The git index is left alone.
     """
     dest_dir = changes_dir(path)
     dest_dir.mkdir(parents=True, exist_ok=True)
@@ -270,12 +241,7 @@ def backup_puppetfile(path: Path) -> Path:
         suffix += 1
     shutil.copy2(path, dest)
     backups = sorted(dest_dir.glob("Puppetfile.*"))
-    root = _git_index(dest_dir)
-    if root is not None:
-        _stage_backup(root, dest, remove=False)
     for old in backups[:-BACKUP_KEEP]:
-        if root is not None:
-            _stage_backup(root, old, remove=True)
         old.unlink(missing_ok=True)
     return dest
 
@@ -425,6 +391,25 @@ def recover(path: Path) -> int:
     return 0
 
 
+def classify(
+    pinned: str,
+    latest: str | None,
+    error: str | None,
+) -> tuple[str, str | None, str]:
+    """One pin compared with one Forge answer.
+
+    Returns ``(pinned, latest, status)``. Same release is current
+    before the sort key is consulted.
+    """
+    if error or latest is None:
+        return pinned, None, error or "lookup failed"
+    if same_release(pinned, latest):
+        return pinned, latest, "current"
+    if version_key(pinned) < version_key(latest):
+        return pinned, latest, "update"
+    return pinned, latest, "current"
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
@@ -490,19 +475,12 @@ def main(argv: list[str] | None = None) -> int:
 
     for slug, pinned in forge:
         latest, error = fetch_current(slug, args.timeout)
-        if error or latest is None:
-            resolved.append((slug, pinned, None, error or "lookup failed"))
+        compared_pin, compared_latest, status = classify(pinned, latest, error)
+        resolved.append((slug, compared_pin, compared_latest, status))
+        if status == "update" and compared_latest is not None:
+            behind.append((slug, compared_pin, compared_latest))
+        elif status != "current":
             failed = True
-            continue
-        # Same release first. The sort key can order two spellings of
-        # one version as "behind" (8.1.0 versus v8.1.0, 1.0 versus 1.0.0).
-        if same_release(pinned, latest):
-            resolved.append((slug, pinned, latest, "current"))
-        elif version_key(pinned) < version_key(latest):
-            resolved.append((slug, pinned, latest, "update"))
-            behind.append((slug, pinned, latest))
-        else:
-            resolved.append((slug, pinned, latest, "current"))
 
     # Updates first, then current pins, then lookups that failed.
     resolved.sort(key=lambda row: ({"update": 0, "current": 1}.get(row[3], 2), row[0]))

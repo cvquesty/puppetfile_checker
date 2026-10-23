@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.1.0 - 2026-10-23
+
+- GitHub Actions runs the test suite on Python 3.9 through 3.13.
+  The Forge is stubbed.
+
 ## 1.0.2 - 2026-10-23
 
 - The table is only modules whose Forge release is newer than the
