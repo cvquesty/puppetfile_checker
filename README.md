@@ -5,8 +5,9 @@ current release of each pinned module, and prints a table.
 
 A pin is **current** when it is the same release as the Forge, including
 `8.1.0` and `v8.1.0`, or `1.0` and `1.0.0`. A pin is **update** only when
-the Forge release is newer. The table lists updates and failed lookups.
-Pins that already match are counted and not printed. Git modules
+the Forge release is newer. The table is that list: module, pinned
+version, and Forge version. A row is omitted when those two versions
+are the same release. Git modules
 (`:git`) are skipped. The Forge does not publish a version for those.
 
 With no switches the script only prints. It does not edit the Puppetfile.
@@ -54,14 +55,13 @@ Do not pass both.
 ### The report
 
 ```text
-module                  pinned   latest   status
-puppetlabs-stdlib       9.6.0    9.7.0    update
-puppetlabs-concat       9.0.2    9.0.2    current
+module                  pinned   latest
+puppetlabs-stdlib       9.6.0    9.7.0
 ```
 
-Current pins are a count in the header. They are not rows. The last
-lines say how many modules should be updated, and how many the Forge
-could not resolve.
+A module whose pin matches the Forge is not a row. The last line is
+how many modules should be updated. A lookup that failed is a count,
+not a row.
 
 ### Exit status
 

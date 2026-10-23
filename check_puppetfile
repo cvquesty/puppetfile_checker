@@ -303,58 +303,56 @@ def confirm(prompt: str, accept: str) -> bool:
     return answer.strip() == accept
 
 
+def needs_update(pinned: str, latest: str | None, status: str) -> bool:
+    """True only when the Forge release is newer than the pin.
+
+    A row whose two versions are the same release is not actionable,
+    even if an earlier step marked it update.
+    """
+    if status != "update" or not latest:
+        return False
+    return not same_release(pinned, latest)
+
+
 def print_report(
     path: Path,
     git_modules: list[str],
     resolved: list[tuple[str, str, str | None, str]],
 ) -> None:
-    """Print modules that need an update. Current pins are a count."""
-    current = sum(1 for row in resolved if row[3] == "current")
-    actionable = [row for row in resolved if row[3] != "current"]
+    """Print the modules to update. Same-version pins are omitted."""
+    updates = [
+        row for row in resolved if needs_update(row[1], row[2], row[3])
+    ]
+    failed = sum(1 for row in resolved if row[3] not in ("current", "update"))
     print(f"Puppetfile: {path}")
-    print(f"Forge modules: {len(resolved)}  current: {current}")
     if git_modules:
         names = ", ".join(git_modules)
         print(f"Skipped git modules (no Forge version): {names}")
     print()
 
-    if not resolved:
-        print("No Forge modules to resolve.")
+    if not updates:
+        print("No Forge modules need an update.")
+        if failed:
+            print(f"{failed} module(s) could not be resolved.")
         return
 
-    if not actionable:
-        print("Every Forge module that resolved is at the latest release.")
-        return
-
-    name_width = max(len(slug) for slug, _, _, _ in actionable)
-    pin_width = max(len(pinned) for _, pinned, _, _ in actionable)
-    latest_width = max(len(latest or "-") for _, _, latest, _ in actionable)
+    name_width = max(len(slug) for slug, _, _, _ in updates)
+    pin_width = max(len(pinned) for _, pinned, _, _ in updates)
+    latest_width = max(len(latest or "") for _, _, latest, _ in updates)
     print(
         f"{'module':<{name_width}}  {'pinned':<{pin_width}}  "
-        f"{'latest':<{latest_width}}  status"
+        f"{'latest':<{latest_width}}"
     )
-    print(
-        f"{'-' * name_width}  {'-' * pin_width}  "
-        f"{'-' * latest_width}  ------"
-    )
-    behind = 0
-    failed = 0
-    for slug, pinned, latest, status in actionable:
-        shown = latest if latest is not None else "-"
+    print(f"{'-' * name_width}  {'-' * pin_width}  {'-' * latest_width}")
+    for slug, pinned, latest, _status in updates:
         print(
             f"{slug:<{name_width}}  {pinned:<{pin_width}}  "
-            f"{shown:<{latest_width}}  {status}"
+            f"{latest:<{latest_width}}"
         )
-        if status == "update":
-            behind += 1
-        else:
-            failed += 1
     print()
-    if behind:
-        print(f"{behind} module(s) should be updated.")
+    print(f"{len(updates)} module(s) should be updated.")
     if failed:
         print(f"{failed} module(s) could not be resolved.")
-    return
 
 
 def apply_updates(path: Path, text: str, behind: list[tuple[str, str, str]]) -> int:

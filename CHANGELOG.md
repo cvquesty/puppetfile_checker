@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.2 - 2026-10-23
+
+- The table is only modules whose Forge release is newer than the
+  pin. A pin that matches the Forge version is not a row.
+
 ## 1.0.1 - 2026-10-23
 
 - The report lists only modules that should be updated, and lookups
