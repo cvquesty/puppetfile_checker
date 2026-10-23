@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.1 - 2026-10-23
+
+- The report lists only modules that should be updated, and lookups
+  that failed. Pins that already match the Forge are a count.
+
 ## 1.0.0 - 2026-10-23
 
 First release.

@@ -8,10 +8,10 @@
 With no switches, this only prints the report. It does not edit the
 Puppetfile, write a backup, or change the git index.
 
-Each Forge pin is resolved to current_release. The report lists every
-module, the pinned version, the latest version, and whether the pin is
-current or behind. Git modules (mod 'name', :git => ...) are skipped.
-The Forge does not publish those.
+Each Forge pin is resolved to current_release. The report lists only
+the modules that are behind, plus any lookup that failed. Pins that
+already match the Forge are counted and not printed. Git modules
+(mod 'name', :git => ...) are skipped. The Forge does not publish those.
 
   --help     show this text and exit
   -f         rewrite behind pins to the latest Forge release
@@ -308,9 +308,11 @@ def print_report(
     git_modules: list[str],
     resolved: list[tuple[str, str, str | None, str]],
 ) -> None:
-    """Print every resolved module. Does not write the Puppetfile."""
+    """Print modules that need an update. Current pins are a count."""
+    current = sum(1 for row in resolved if row[3] == "current")
+    actionable = [row for row in resolved if row[3] != "current"]
     print(f"Puppetfile: {path}")
-    print(f"Forge modules: {len(resolved)}")
+    print(f"Forge modules: {len(resolved)}  current: {current}")
     if git_modules:
         names = ", ".join(git_modules)
         print(f"Skipped git modules (no Forge version): {names}")
@@ -320,9 +322,13 @@ def print_report(
         print("No Forge modules to resolve.")
         return
 
-    name_width = max(len(slug) for slug, _, _, _ in resolved)
-    pin_width = max(len(pinned) for _, pinned, _, _ in resolved)
-    latest_width = max(len(latest or "-") for _, _, latest, _ in resolved)
+    if not actionable:
+        print("Every Forge module that resolved is at the latest release.")
+        return
+
+    name_width = max(len(slug) for slug, _, _, _ in actionable)
+    pin_width = max(len(pinned) for _, pinned, _, _ in actionable)
+    latest_width = max(len(latest or "-") for _, _, latest, _ in actionable)
     print(
         f"{'module':<{name_width}}  {'pinned':<{pin_width}}  "
         f"{'latest':<{latest_width}}  status"
@@ -333,7 +339,7 @@ def print_report(
     )
     behind = 0
     failed = 0
-    for slug, pinned, latest, status in resolved:
+    for slug, pinned, latest, status in actionable:
         shown = latest if latest is not None else "-"
         print(
             f"{slug:<{name_width}}  {pinned:<{pin_width}}  "
@@ -341,15 +347,14 @@ def print_report(
         )
         if status == "update":
             behind += 1
-        elif status != "current":
+        else:
             failed += 1
     print()
     if behind:
         print(f"{behind} module(s) should be updated.")
-    else:
-        print("Every Forge module that resolved is at the latest release.")
     if failed:
         print(f"{failed} module(s) could not be resolved.")
+    return
 
 
 def apply_updates(path: Path, text: str, behind: list[tuple[str, str, str]]) -> int:
